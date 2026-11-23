@@ -308,7 +308,9 @@ class ResponsesAPIRequestUtils:
             if len(parts) < 2:
                 return None, wrapped_content
 
-            metadata_b64 = parts[0].replace("litellm_enc:", "")
+            metadata_b64 = parts[0][len("litellm_enc:") :]
+            if not metadata_b64:
+                return None, wrapped_content
             original_content = parts[1]
 
             # Restore padding if needed
@@ -316,10 +318,14 @@ class ResponsesAPIRequestUtils:
             if missing:
                 metadata_b64 += "=" * (4 - missing)
 
-            decoded_metadata = base64.b64decode(metadata_b64.encode("utf-8")).decode(
-                "utf-8"
-            )
-            model_id = decoded_metadata.replace("model_id:", "")
+            decoded_metadata = base64.b64decode(
+                metadata_b64.encode("utf-8"), validate=True
+            ).decode("utf-8")
+            if not decoded_metadata.startswith("model_id:"):
+                return None, wrapped_content
+            model_id = decoded_metadata[len("model_id:") :]
+            if not model_id:
+                return None, wrapped_content
             return model_id, original_content
         except Exception:
             return None, wrapped_content

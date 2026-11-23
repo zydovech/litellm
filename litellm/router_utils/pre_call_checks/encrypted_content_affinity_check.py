@@ -40,6 +40,9 @@ from typing import Any, List, Optional, cast
 
 from litellm._logging import verbose_router_logger
 from litellm.integrations.custom_logger import CustomLogger, Span
+from litellm.llms.anthropic.experimental_pass_through.messages.encrypted_content_affinity import (
+    extract_latest_model_id_from_anthropic_messages,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.types.llms.openai import AllMessageValues
 
@@ -138,20 +141,34 @@ class EncryptedContentAffinityCheck(CustomLogger):
         request_kwargs = request_kwargs or {}
         typed_healthy_deployments = cast(List[dict], healthy_deployments)
 
-        # Signal to the response post-processor that encrypted item IDs should be
+        # Clear any stale pin flag from a prior Router retry attempt before
+        # re-evaluating affinity for the current healthy_deployments list.
+        request_kwargs.pop("_encrypted_content_affinity_pinned", None)
+
+        # Signal to the response post-processor that encrypted fields should be
         # encoded in the output of this request.  Only set the flag when
-        # litellm_metadata already exists (Responses API path).  Using
-        # setdefault would create an empty litellm_metadata dict for chat
+        # litellm_metadata already exists (Responses API and /v1/messages paths).
+        # Using setdefault would create an empty litellm_metadata dict for chat
         # completions / embeddings, which breaks tag-based routing because
         # _get_metadata_variable_name_from_kwargs would pick "litellm_metadata"
         # over "metadata" where tags are actually stored.
-        if "litellm_metadata" in request_kwargs:
+        has_litellm_metadata = "litellm_metadata" in request_kwargs
+        if has_litellm_metadata and isinstance(
+            request_kwargs["litellm_metadata"], dict
+        ):
             request_kwargs["litellm_metadata"][
                 "encrypted_content_affinity_enabled"
             ] = True
 
         request_input = request_kwargs.get("input")
         model_id = self._extract_model_id_from_input(request_input)
+        if not model_id and has_litellm_metadata:
+            anthropic_messages = (
+                messages if messages is not None else request_kwargs.get("messages")
+            )
+            model_id = extract_latest_model_id_from_anthropic_messages(
+                anthropic_messages
+            )
         if not model_id:
             return typed_healthy_deployments
 

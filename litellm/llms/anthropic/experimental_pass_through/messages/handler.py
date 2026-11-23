@@ -26,6 +26,11 @@ from litellm.utils import ProviderConfigManager, client
 
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
+from .encrypted_content_affinity import (
+    apply_anthropic_response_affinity_wrapping,
+    get_anthropic_affinity_context,
+    prepare_anthropic_messages_for_deployment,
+)
 from .interceptors import get_messages_interceptors
 from .utils import AnthropicMessagesRequestUtils, mock_response
 
@@ -192,6 +197,12 @@ async def anthropic_messages(
         "_websearch_interception_converted_stream", False
     )
 
+    _, current_model_id = get_anthropic_affinity_context(kwargs)
+    messages = prepare_anthropic_messages_for_deployment(
+        messages=messages,
+        current_model_id=current_model_id,
+    )
+
     # Execute pre-request hooks to allow CustomLoggers to modify request
     request_kwargs = await _execute_pre_request_hooks(
         model=model,
@@ -235,14 +246,17 @@ async def anthropic_messages(
         stream=original_stream,
     )
     if short_circuit_response is not None:
-        return short_circuit_response
+        return apply_anthropic_response_affinity_wrapping(
+            response=short_circuit_response,
+            kwargs=kwargs,
+        )
 
     # Run registered MessagesInterceptors (e.g. advisor orchestration loop).
     # api_key and api_base are explicit params (not in **kwargs) so pass them
     # explicitly so interceptor sub-calls can route to the same backend.
     for interceptor in get_messages_interceptors():
         if interceptor.can_handle(tools, custom_llm_provider):
-            return await interceptor.handle(
+            interceptor_response = await interceptor.handle(
                 model=model,
                 messages=messages,
                 tools=tools,
@@ -253,9 +267,14 @@ async def anthropic_messages(
                 api_base=api_base,
                 **kwargs,
             )
+            return apply_anthropic_response_affinity_wrapping(
+                response=interceptor_response,
+                kwargs=kwargs,
+            )
 
     loop = asyncio.get_event_loop()
     kwargs["is_async"] = True
+    kwargs.pop("_encrypted_content_affinity_prepared", None)
 
     func = partial(
         anthropic_messages_handler,
@@ -276,6 +295,7 @@ async def anthropic_messages(
         api_base=api_base,
         client=client,
         custom_llm_provider=custom_llm_provider,
+        _encrypted_content_affinity_prepared=True,
         **kwargs,
     )
     ctx = contextvars.copy_context()
@@ -286,7 +306,10 @@ async def anthropic_messages(
         response = await init_response
     else:
         response = init_response
-    return response
+    return apply_anthropic_response_affinity_wrapping(
+        response=response,
+        kwargs=kwargs,
+    )
 
 
 def validate_anthropic_api_metadata(metadata: Optional[Dict] = None) -> Optional[Dict]:
@@ -334,6 +357,13 @@ def anthropic_messages_handler(
     """
     from litellm.types.utils import LlmProviders
 
+    if not kwargs.pop("_encrypted_content_affinity_prepared", False):
+        _, _current_model_id = get_anthropic_affinity_context(kwargs)
+        messages = prepare_anthropic_messages_for_deployment(
+            messages=messages,
+            current_model_id=_current_model_id,
+        )
+
     metadata = validate_anthropic_api_metadata(metadata)
 
     local_vars = locals()
@@ -379,11 +409,16 @@ def anthropic_messages_handler(
             ] = True
 
     if litellm_params.mock_response and isinstance(litellm_params.mock_response, str):
-        return mock_response(
+        mocked = mock_response(
             model=model,
             messages=messages,
             max_tokens=max_tokens,
             mock_response=litellm_params.mock_response,
+        )
+        return (
+            mocked
+            if is_async
+            else apply_anthropic_response_affinity_wrapping(mocked, kwargs)
         )
 
     anthropic_messages_provider_config: Optional[BaseAnthropicMessagesConfig] = None
@@ -421,13 +456,32 @@ def anthropic_messages_handler(
             **kwargs,
         )
         if _should_route_to_responses_api(custom_llm_provider):
-            return LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
+            # Disable inner Responses API affinity wrapping so the outer /v1/messages
+            # boundary wrapper owns wrapping without risking double-wrapping.
+            inner_metadata = _shared_kwargs.get("litellm_metadata")
+            if isinstance(inner_metadata, dict) and inner_metadata.get(
+                "encrypted_content_affinity_enabled"
+            ):
+                _shared_kwargs = {
+                    **_shared_kwargs,
+                    "litellm_metadata": {
+                        **inner_metadata,
+                        "encrypted_content_affinity_enabled": False,
+                    },
+                }
+            adapter_result = (
+                LiteLLMMessagesToResponsesAPIHandler.anthropic_messages_handler(
+                    **_shared_kwargs
+                )
+            )
+        else:
+            adapter_result = LiteLLMMessagesToCompletionTransformationHandler.anthropic_messages_handler(
                 **_shared_kwargs
             )
         return (
-            LiteLLMMessagesToCompletionTransformationHandler.anthropic_messages_handler(
-                **_shared_kwargs
-            )
+            adapter_result
+            if is_async
+            else apply_anthropic_response_affinity_wrapping(adapter_result, kwargs)
         )
 
     if custom_llm_provider is None:
@@ -441,7 +495,7 @@ def anthropic_messages_handler(
             params=local_vars
         )
     )
-    return base_llm_http_handler.anthropic_messages_handler(
+    handler_result = base_llm_http_handler.anthropic_messages_handler(
         model=model,
         messages=messages,
         anthropic_messages_provider_config=anthropic_messages_provider_config,
@@ -457,4 +511,9 @@ def anthropic_messages_handler(
         api_base=api_base,
         stream=stream,
         kwargs=kwargs,
+    )
+    return (
+        handler_result
+        if is_async
+        else apply_anthropic_response_affinity_wrapping(handler_result, kwargs)
     )
